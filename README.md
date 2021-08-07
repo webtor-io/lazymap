@@ -4,9 +4,13 @@ Golang thread-safe LazyMap implementation with additional features:
 
 1. Concurrency control
 2. Capacity control (if defined, it automatically cleans least recently used elements)
-3. Expiration (if defiend, it automatically deletes expired elements)
+3. Expiration (if defined, it automatically deletes expired elements)
 
 The main purpose of LazyMap at [webtor.io](//webtor.io) was to reduce requests between services by introducing intermediate caching-layer.
+
+## But what is LazyMap anyway?
+
+Unlike ordinary Map, LazyMap evaluates value on demand if there is no value already exists for a specific key.
 
 ## Example
 
