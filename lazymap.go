@@ -117,6 +117,13 @@ func (s *LazyMap) clean() {
 	s.cleaning = false
 }
 
+func (s *LazyMap) Has(key string) bool {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	_, loaded := s.m[key]
+	return loaded
+}
+
 func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, error) {
 	s.mux.RLock()
 	v, loaded := s.m[key]

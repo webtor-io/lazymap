@@ -23,6 +23,10 @@ func NewTestMap(c *Config, sleep int, er float64) *TestMap {
 	}
 }
 
+func (s *TestMap) Has(n int) bool {
+	return s.LazyMap.Has(fmt.Sprintf("%v", n))
+}
+
 func (s *TestMap) Get(n int) (int, error) {
 	v, _ := s.LazyMap.Get(fmt.Sprintf("%v", n), func() (interface{}, error) {
 		<-time.After(s.sleep)
@@ -34,6 +38,14 @@ func (s *TestMap) Get(n int) (int, error) {
 	return v.(int), nil
 }
 
+func TestHas(t *testing.T) {
+	p := NewTestMap(&Config{}, 0, 0)
+	p.Get(1)
+	ok := p.Has(1)
+	if !ok {
+		t.Fatalf("p.Has(%v) == %v, expected true", 1, ok)
+	}
+}
 func TestSequental(t *testing.T) {
 	p := NewTestMap(&Config{}, 0, 0)
 	for i := 0; i < 10; i++ {
