@@ -46,6 +46,31 @@ func TestHas(t *testing.T) {
 		t.Fatalf("p.Has(%v) == %v, expected true", 1, ok)
 	}
 }
+func TestHasWithLongRunningTask(t *testing.T) {
+	s := time.Now()
+	p := NewTestMap(&Config{
+		Concurrency: 1,
+	}, 1000, 0)
+	go func() {
+		p.Get(1)
+	}()
+	<-time.After(50 * time.Millisecond)
+	go func() {
+		p.Get(2)
+	}()
+	<-time.After(50 * time.Millisecond)
+	ok := p.Has(1)
+	if !ok {
+		t.Fatalf("p.Has(%v) == %v, expected true", 1, ok)
+	}
+	ok = p.Has(2)
+	if ok {
+		t.Fatalf("p.Has(%v) == %v, expected false", 2, ok)
+	}
+	if time.Since(s) > time.Second {
+		t.Fatalf("It takes %v seconds to perform test, expected less than 1 second", time.Since(s).Seconds())
+	}
+}
 func TestSequental(t *testing.T) {
 	p := NewTestMap(&Config{}, 0, 0)
 	for i := 0; i < 10; i++ {

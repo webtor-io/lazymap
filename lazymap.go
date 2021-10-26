@@ -118,8 +118,8 @@ func (s *LazyMap) clean() {
 }
 
 func (s *LazyMap) Has(key string) bool {
-	s.mux.RLock()
-	defer s.mux.RUnlock()
+	// s.mux.RLock()
+	// defer s.mux.RUnlock()
 	_, loaded := s.m[key]
 	return loaded
 }
