@@ -73,8 +73,12 @@ type lazyMapItem struct {
 	c      chan bool
 }
 
-func (s *lazyMapItem) Get() (interface{}, error) {
+func (s *lazyMapItem) Touch() {
 	s.la = time.Now()
+}
+
+func (s *lazyMapItem) Get() (interface{}, error) {
+	s.Touch()
 	s.mux.Lock()
 	defer s.mux.Unlock()
 	if s.inited {
@@ -120,10 +124,17 @@ func (s *LazyMap) clean() {
 }
 
 func (s *LazyMap) Has(key string) bool {
-	// s.mux.RLock()
-	// defer s.mux.RUnlock()
 	_, loaded := s.m[key]
 	return loaded
+}
+
+func (s *LazyMap) Touch(key string) bool {
+	v, loaded := s.m[key]
+	if loaded {
+		v.Touch()
+		return true
+	}
+	return false
 }
 
 func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, error) {
