@@ -143,8 +143,8 @@ func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, e
 	}
 	s.m[key] = v
 	s.clean()
-	<-s.c
 	s.mux.Unlock()
+	<-s.c
 	r, err := v.Get()
 	if err != nil && s.errorExpire != 0 {
 		go s.doExpire(s.errorExpire, key)
