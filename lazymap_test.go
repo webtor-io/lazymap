@@ -64,8 +64,8 @@ func TestHasWithLongRunningTask(t *testing.T) {
 		t.Fatalf("p.Has(%v) == %v, expected true", 1, ok)
 	}
 	ok = p.Has(2)
-	if ok {
-		t.Fatalf("p.Has(%v) == %v, expected false", 2, ok)
+	if !ok {
+		t.Fatalf("p.Has(%v) == %v, expected true", 2, ok)
 	}
 	if time.Since(s) > time.Second {
 		t.Fatalf("It takes %v seconds to perform test, expected less than 1 second", time.Since(s).Seconds())

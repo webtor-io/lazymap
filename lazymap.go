@@ -95,7 +95,8 @@ func (s *LazyMap) clean() {
 	if s.capacity == 0 {
 		return
 	}
-	if len(s.m) < int(math.Ceil(s.cleanThreshold*float64(s.capacity))) {
+	thr := int(math.Ceil(s.cleanThreshold * float64(s.capacity)))
+	if len(s.m) <= thr {
 		return
 	}
 	if s.cleaning {
@@ -110,9 +111,7 @@ func (s *LazyMap) clean() {
 		return t[i].la.Before(t[j].la)
 	})
 	for i := 0; i < int(math.Ceil(s.cleanRatio*float64(s.capacity))); i++ {
-		if t[i].inited {
-			delete(s.m, t[i].key)
-		}
+		delete(s.m, t[i].key)
 	}
 	s.cleaning = false
 }
@@ -138,13 +137,13 @@ func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, e
 		s.mux.Unlock()
 		return v.Get()
 	}
-	<-s.c
-	s.clean()
 	v = &lazyMapItem{
 		key: key,
 		f:   f,
 	}
 	s.m[key] = v
+	s.clean()
+	<-s.c
 	s.mux.Unlock()
 	r, err := v.Get()
 	if err != nil && s.errorExpire != 0 {
