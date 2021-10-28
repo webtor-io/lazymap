@@ -70,17 +70,20 @@ type lazyMapItem struct {
 	err    error
 	la     time.Time
 	mux    sync.Mutex
+	c      chan bool
 }
 
 func (s *lazyMapItem) Get() (interface{}, error) {
+	s.la = time.Now()
 	s.mux.Lock()
 	defer s.mux.Unlock()
-	s.la = time.Now()
 	if s.inited {
 		return s.val, s.err
 	}
+	<-s.c
 	s.val, s.err = s.f()
 	s.inited = true
+	s.c <- true
 	return s.val, s.err
 }
 
@@ -140,17 +143,16 @@ func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, e
 	v = &lazyMapItem{
 		key: key,
 		f:   f,
+		c:   s.c,
 	}
 	s.m[key] = v
 	s.clean()
 	s.mux.Unlock()
-	<-s.c
 	r, err := v.Get()
 	if err != nil && s.errorExpire != 0 {
 		go s.doExpire(s.errorExpire, key)
 	} else if err == nil && s.expire != 0 {
 		go s.doExpire(s.expire, key)
 	}
-	s.c <- true
 	return r, err
 }
