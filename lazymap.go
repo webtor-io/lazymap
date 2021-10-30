@@ -126,6 +126,7 @@ func (s *lazyMapItem) doExpire(exp time.Duration) <-chan time.Time {
 func (s *lazyMapItem) Get() (interface{}, error) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
+	s.la = time.Now()
 	if s.inited {
 		return s.val, s.err
 	}
