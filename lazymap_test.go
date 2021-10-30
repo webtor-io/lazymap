@@ -23,8 +23,8 @@ func NewTestMap(c *Config, sleep int, er float64) *TestMap {
 	}
 }
 
-func (s *TestMap) Has(n int) bool {
-	return s.LazyMap.Has(fmt.Sprintf("%v", n))
+func (s *TestMap) Status(n int) (ItemStatus, bool) {
+	return s.LazyMap.Status(fmt.Sprintf("%v", n))
 }
 
 func (s *TestMap) Get(n int) (int, error) {
@@ -44,7 +44,7 @@ func (s *TestMap) Get(n int) (int, error) {
 func TestHas(t *testing.T) {
 	p := NewTestMap(&Config{}, 0, 0)
 	p.Get(1)
-	ok := p.Has(1)
+	_, ok := p.Status(1)
 	if !ok {
 		t.Fatalf("p.Has(%v) == %v, expected true", 1, ok)
 	}
@@ -62,11 +62,11 @@ func TestHasWithLongRunningTask(t *testing.T) {
 		p.Get(2)
 	}()
 	<-time.After(50 * time.Millisecond)
-	ok := p.Has(1)
+	_, ok := p.Status(1)
 	if !ok {
 		t.Fatalf("p.Has(%v) == %v, expected true", 1, ok)
 	}
-	ok = p.Has(2)
+	_, ok = p.Status(2)
 	if !ok {
 		t.Fatalf("p.Has(%v) == %v, expected true", 2, ok)
 	}

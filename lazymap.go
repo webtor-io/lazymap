@@ -7,6 +7,17 @@ import (
 	"time"
 )
 
+type ItemStatus int
+
+const (
+	None ItemStatus = iota
+	Enqueued
+	Running
+	Done
+	Failed
+	Canceled
+)
+
 type LazyMap struct {
 	mux            sync.RWMutex
 	m              map[string]*lazyMapItem
@@ -179,9 +190,24 @@ func (s *LazyMap) clean() {
 	s.cleaning = false
 }
 
-func (s *LazyMap) Has(key string) bool {
-	_, loaded := s.m[key]
-	return loaded
+func (s *LazyMap) Status(key string) (ItemStatus, bool) {
+	v, loaded := s.m[key]
+	if !loaded {
+		return None, false
+	}
+	if v.cancel {
+		return Canceled, true
+	}
+	if v.running {
+		return Running, true
+	}
+	if v.inited && v.err != nil {
+		return Failed, true
+	}
+	if v.inited && v.err == nil {
+		return Done, true
+	}
+	return Enqueued, true
 }
 
 func (s *LazyMap) Touch(key string) bool {
