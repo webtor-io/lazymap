@@ -12,40 +12,50 @@ type LazyMap struct {
 	m              map[string]*lazyMapItem
 	expire         time.Duration
 	errorExpire    time.Duration
+	initExpire     time.Duration
 	c              chan bool
 	capacity       int
 	cleanThreshold float64
 	cleanRatio     float64
 	cleaning       bool
+	evictNotInited bool
 }
 
 type Config struct {
 	Concurrency    int
 	Expire         time.Duration
 	ErrorExpire    time.Duration
+	InitExpire     time.Duration
 	Capacity       int
 	CleanThreshold float64
 	CleanRatio     float64
+	EvictNotInited bool
 }
 
-func New(conf *Config) LazyMap {
-	capacity := conf.Capacity
+type EvictedError struct{}
+
+func (s *EvictedError) Error() string {
+	return "Evicted"
+}
+
+func New(cfg *Config) LazyMap {
+	capacity := cfg.Capacity
 	concurrency := 10
-	if conf.Concurrency != 0 {
-		concurrency = conf.Concurrency
+	if cfg.Concurrency != 0 {
+		concurrency = cfg.Concurrency
 	}
-	expire := conf.Expire
+	expire := cfg.Expire
 	errorExpire := expire
-	if conf.ErrorExpire != 0 {
-		errorExpire = conf.ErrorExpire
+	if cfg.ErrorExpire != 0 {
+		errorExpire = cfg.ErrorExpire
 	}
 	cleanThreshold := 0.9
-	if conf.CleanThreshold != 0 {
-		cleanThreshold = conf.CleanThreshold
+	if cfg.CleanThreshold != 0 {
+		cleanThreshold = cfg.CleanThreshold
 	}
 	cleanRatio := 0.1
-	if conf.CleanRatio != 0 {
-		cleanRatio = conf.CleanRatio
+	if cfg.CleanRatio != 0 {
+		cleanRatio = cfg.CleanRatio
 	}
 	c := make(chan bool, concurrency)
 	for i := 0; i < concurrency; i++ {
@@ -55,47 +65,84 @@ func New(conf *Config) LazyMap {
 		c:              c,
 		expire:         expire,
 		errorExpire:    errorExpire,
+		initExpire:     cfg.InitExpire,
 		capacity:       capacity,
 		cleanThreshold: cleanThreshold,
 		cleanRatio:     cleanRatio,
+		evictNotInited: cfg.EvictNotInited,
 		m:              make(map[string]*lazyMapItem, capacity),
 	}
 }
 
 type lazyMapItem struct {
-	key    string
-	val    interface{}
-	f      func() (interface{}, error)
-	inited bool
-	err    error
-	la     time.Time
-	mux    sync.Mutex
-	c      chan bool
+	key     string
+	val     interface{}
+	f       func() (interface{}, error)
+	inited  bool
+	err     error
+	la      time.Time
+	mux     sync.Mutex
+	cancel  bool
+	c       chan bool
+	t       *time.Timer
+	exp     time.Duration
+	running bool
 }
 
 func (s *lazyMapItem) Touch() {
+	if s.t != nil {
+		s.t.Reset(s.exp)
+	}
 	s.la = time.Now()
 }
 
+func (s *lazyMapItem) Cancel() {
+	if s.t != nil {
+		s.t.Stop()
+	}
+	s.cancel = true
+}
+
+func (s *lazyMapItem) doExpire(exp time.Duration) <-chan time.Time {
+	if s.t != nil {
+		s.t.Stop()
+	}
+	s.exp = exp
+	s.t = time.NewTimer(exp)
+	return s.t.C
+}
+
 func (s *lazyMapItem) Get() (interface{}, error) {
-	s.Touch()
 	s.mux.Lock()
 	defer s.mux.Unlock()
 	if s.inited {
 		return s.val, s.err
 	}
 	<-s.c
-	s.val, s.err = s.f()
+	if s.t != nil {
+		s.t.Stop()
+		s.t = nil
+	}
+	s.running = true
+	if s.cancel {
+		s.val, s.err = nil, &EvictedError{}
+	} else {
+		s.val, s.err = s.f()
+	}
 	s.inited = true
+	s.running = false
 	s.c <- true
 	return s.val, s.err
 }
 
-func (s *LazyMap) doExpire(expire time.Duration, key string) {
-	<-time.After(expire)
-	s.mux.Lock()
-	delete(s.m, key)
-	s.mux.Unlock()
+func (s *LazyMap) doExpire(expire time.Duration, key string, v *lazyMapItem) {
+	c := v.doExpire(expire)
+	go func() {
+		<-c
+		s.mux.Lock()
+		delete(s.m, key)
+		s.mux.Unlock()
+	}()
 }
 
 func (s *LazyMap) clean() {
@@ -117,8 +164,17 @@ func (s *LazyMap) clean() {
 	sort.Slice(t, func(i, j int) bool {
 		return t[i].la.Before(t[j].la)
 	})
-	for i := 0; i < int(math.Ceil(s.cleanRatio*float64(s.capacity))); i++ {
-		delete(s.m, t[i].key)
+	cq := int(math.Ceil(s.cleanRatio * float64(s.capacity)))
+	dc := 0
+	for i := 0; i < len(t); i++ {
+		if !t[i].running && (t[i].inited || s.evictNotInited) {
+			t[i].Cancel()
+			delete(s.m, t[i].key)
+			dc++
+		}
+		if dc >= cq {
+			break
+		}
 	}
 	s.cleaning = false
 }
@@ -155,15 +211,19 @@ func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, e
 		key: key,
 		f:   f,
 		c:   s.c,
+		la:  time.Now(),
 	}
 	s.m[key] = v
 	s.clean()
 	s.mux.Unlock()
+	if s.initExpire != 0 {
+		s.doExpire(s.initExpire, key, v)
+	}
 	r, err := v.Get()
 	if err != nil && s.errorExpire != 0 {
-		go s.doExpire(s.errorExpire, key)
+		s.doExpire(s.errorExpire, key, v)
 	} else if err == nil && s.expire != 0 {
-		go s.doExpire(s.expire, key)
+		s.doExpire(s.expire, key, v)
 	}
 	return r, err
 }

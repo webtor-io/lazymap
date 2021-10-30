@@ -28,13 +28,16 @@ func (s *TestMap) Has(n int) bool {
 }
 
 func (s *TestMap) Get(n int) (int, error) {
-	v, _ := s.LazyMap.Get(fmt.Sprintf("%v", n), func() (interface{}, error) {
+	v, err := s.LazyMap.Get(fmt.Sprintf("%v", n), func() (interface{}, error) {
 		<-time.After(s.sleep)
 		if rand.Float64() < s.er {
 			return 0, errors.New("Error!")
 		}
 		return n, nil
 	})
+	if err != nil {
+		return 0, nil
+	}
 	return v.(int), nil
 }
 
@@ -121,6 +124,22 @@ func TestConcurrentWithConcurrency10AndExpire(t *testing.T) {
 	}
 }
 
+func TestConcurrentWithConcurrency10AndInitExpire(t *testing.T) {
+	p := NewTestMap(&Config{Concurrency: 1, InitExpire: 10 * time.Millisecond}, 200, 0)
+	var wg sync.WaitGroup
+	wg.Add(10)
+	for i := 0; i < 10; i++ {
+		go func(i int) {
+			p.Get(i)
+			wg.Done()
+		}(i)
+	}
+	<-time.After(50 * time.Millisecond)
+	if len(p.m) != 1 {
+		t.Fatalf("len(p,m) == %v, expected %v", len(p.m), 1)
+	}
+}
+
 func TestConcurrentWithConcurrency1(t *testing.T) {
 	s := time.Now()
 	p := NewTestMap(&Config{
@@ -144,7 +163,23 @@ func TestConcurrentWithConcurrency1(t *testing.T) {
 }
 
 func TestOutOfCapacity1WithConcurrency1(t *testing.T) {
-	p := NewTestMap(&Config{Concurrency: 1, Capacity: 1}, 0, 0)
+	p := NewTestMap(&Config{Concurrency: 1, Capacity: 1}, 1, 0)
+	var wg sync.WaitGroup
+	wg.Add(10)
+	for i := 0; i < 10; i++ {
+		go func(i int) {
+			p.Get(i)
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+	if len(p.m) != 10 {
+		t.Fatalf("len(p,m) == %v, expected %v", len(p.m), 10)
+	}
+}
+
+func TestOutOfCapacity1WithConcurrency1WithEviction(t *testing.T) {
+	p := NewTestMap(&Config{Concurrency: 1, Capacity: 1, EvictNotInited: true}, 1, 0)
 	var wg sync.WaitGroup
 	wg.Add(10)
 	for i := 0; i < 10; i++ {
@@ -201,7 +236,7 @@ func TestOutOfCapacity100WithConcurrency10(t *testing.T) {
 	}
 }
 
-func BenchmarkCapacity100WConcurrency10(b *testing.B) {
+func BenchmarkCapacity100Concurrency10(b *testing.B) {
 	p := NewTestMap(&Config{Capacity: 100}, 0, 0)
 	var wg sync.WaitGroup
 	wg.Add(b.N)
@@ -231,6 +266,20 @@ func BenchmarkCapacity1000Concurrency100(b *testing.B) {
 
 func BenchmarkCapacity1000WConcurrency100Expire(b *testing.B) {
 	p := NewTestMap(&Config{Capacity: 1000, Concurrency: 100, Expire: 10 * time.Millisecond, ErrorExpire: 5 * time.Millisecond}, 10, 0.1)
+	var wg sync.WaitGroup
+	wg.Add(b.N)
+	for i := 0; i < b.N; i++ {
+		go func() {
+			i := rand.Intn(10000)
+			p.Get(i)
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+}
+
+func BenchmarkCapacity1000WConcurrency100ExpireAndInitExpire(b *testing.B) {
+	p := NewTestMap(&Config{Capacity: 1000, Concurrency: 100, InitExpire: 10 * time.Millisecond, Expire: 10 * time.Millisecond, ErrorExpire: 5 * time.Millisecond}, 10, 0.1)
 	var wg sync.WaitGroup
 	wg.Add(b.N)
 	for i := 0; i < b.N; i++ {
