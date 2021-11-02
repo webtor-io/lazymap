@@ -152,6 +152,7 @@ func (s *LazyMap) doExpire(expire time.Duration, key string, v *lazyMapItem) {
 	go func() {
 		<-c
 		s.mux.Lock()
+		v.Cancel()
 		delete(s.m, key)
 		s.mux.Unlock()
 	}()
