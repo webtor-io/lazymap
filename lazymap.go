@@ -95,6 +95,7 @@ type lazyMapItem struct {
 	mux     sync.Mutex
 	cancel  bool
 	c       chan bool
+	cc      chan bool
 	t       *time.Timer
 	exp     time.Duration
 	running bool
@@ -108,10 +109,14 @@ func (s *lazyMapItem) Touch() {
 }
 
 func (s *lazyMapItem) Cancel() {
+	if s.cancel {
+		return
+	}
 	if s.t != nil {
 		s.t.Stop()
 	}
 	s.cancel = true
+	close(s.cc)
 }
 
 func (s *lazyMapItem) doExpire(exp time.Duration) <-chan time.Time {
@@ -130,7 +135,12 @@ func (s *lazyMapItem) Get() (interface{}, error) {
 	if s.inited {
 		return s.val, s.err
 	}
-	<-s.c
+
+	select {
+	case <-s.c:
+	case <-s.cc:
+	}
+
 	if s.t != nil {
 		s.t.Stop()
 		s.t = nil
@@ -140,10 +150,10 @@ func (s *lazyMapItem) Get() (interface{}, error) {
 		s.val, s.err = nil, &EvictedError{}
 	} else {
 		s.val, s.err = s.f()
+		s.c <- true
 	}
 	s.inited = true
 	s.running = false
-	s.c <- true
 	return s.val, s.err
 }
 
@@ -239,6 +249,7 @@ func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, e
 		key: key,
 		f:   f,
 		c:   s.c,
+		cc:  make(chan bool),
 		la:  time.Now(),
 	}
 	s.m[key] = v
