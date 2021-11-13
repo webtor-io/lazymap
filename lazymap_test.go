@@ -41,7 +41,7 @@ func (s *TestMap) Get(n int) (int, error) {
 	return v.(int), nil
 }
 
-func TestHas(t *testing.T) {
+func TestStatus(t *testing.T) {
 	p := NewTestMap(&Config{}, 0, 0)
 	p.Get(1)
 	_, ok := p.Status(1)

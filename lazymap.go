@@ -94,8 +94,6 @@ type lazyMapItem struct {
 	la      time.Time
 	mux     sync.Mutex
 	cancel  bool
-	c       chan bool
-	cc      chan bool
 	t       *time.Timer
 	exp     time.Duration
 	running bool
@@ -116,7 +114,6 @@ func (s *lazyMapItem) Cancel() {
 		s.t.Stop()
 	}
 	s.cancel = true
-	close(s.cc)
 }
 
 func (s *lazyMapItem) doExpire(exp time.Duration) <-chan time.Time {
@@ -136,11 +133,6 @@ func (s *lazyMapItem) Get() (interface{}, error) {
 		return s.val, s.err
 	}
 
-	select {
-	case <-s.c:
-	case <-s.cc:
-	}
-
 	if s.t != nil {
 		s.t.Stop()
 		s.t = nil
@@ -150,7 +142,6 @@ func (s *lazyMapItem) Get() (interface{}, error) {
 		s.val, s.err = nil, &EvictedError{}
 	} else {
 		s.val, s.err = s.f()
-		s.c <- true
 	}
 	s.inited = true
 	s.running = false
@@ -202,24 +193,28 @@ func (s *LazyMap) clean() {
 	s.cleaning = false
 }
 
+func (s *lazyMapItem) Status() ItemStatus {
+	if s.cancel {
+		return Canceled
+	}
+	if s.running {
+		return Running
+	}
+	if s.inited && s.err != nil {
+		return Failed
+	}
+	if s.inited && s.err == nil {
+		return Done
+	}
+	return Enqueued
+}
+
 func (s *LazyMap) Status(key string) (ItemStatus, bool) {
 	v, loaded := s.m[key]
 	if !loaded {
 		return None, false
 	}
-	if v.cancel {
-		return Canceled, true
-	}
-	if v.running {
-		return Running, true
-	}
-	if v.inited && v.err != nil {
-		return Failed, true
-	}
-	if v.inited && v.err == nil {
-		return Done, true
-	}
-	return Enqueued, true
+	return v.Status(), true
 }
 
 func (s *LazyMap) Touch(key string) bool {
@@ -248,8 +243,6 @@ func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, e
 	v = &lazyMapItem{
 		key: key,
 		f:   f,
-		c:   s.c,
-		cc:  make(chan bool),
 		la:  time.Now(),
 	}
 	s.m[key] = v
@@ -258,7 +251,9 @@ func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, e
 	if s.initExpire != 0 {
 		s.doExpire(s.initExpire, key, v)
 	}
+	<-s.c
 	r, err := v.Get()
+	s.c <- true
 	if err != nil && s.errorExpire != 0 {
 		s.doExpire(s.errorExpire, key, v)
 	} else if err == nil && s.expire != 0 {
