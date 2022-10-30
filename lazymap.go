@@ -23,6 +23,7 @@ type LazyMap struct {
 	m              map[string]*lazyMapItem
 	expire         time.Duration
 	errorExpire    time.Duration
+	storeErrors    bool
 	initExpire     time.Duration
 	c              chan bool
 	capacity       int
@@ -36,6 +37,7 @@ type Config struct {
 	Concurrency    int
 	Expire         time.Duration
 	ErrorExpire    time.Duration
+	StoreErrors    bool
 	InitExpire     time.Duration
 	Capacity       int
 	CleanThreshold float64
@@ -76,6 +78,7 @@ func New(cfg *Config) LazyMap {
 		c:              c,
 		expire:         expire,
 		errorExpire:    errorExpire,
+		storeErrors:    cfg.StoreErrors,
 		initExpire:     cfg.InitExpire,
 		capacity:       capacity,
 		cleanThreshold: cleanThreshold,
@@ -254,10 +257,21 @@ func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, e
 	<-s.c
 	r, err := v.Get()
 	s.c <- true
-	if err != nil && s.errorExpire != 0 {
+	if err != nil && !s.storeErrors {
+		s.Drop(key)
+	} else if err != nil && s.errorExpire != 0 {
 		s.doExpire(s.errorExpire, key, v)
 	} else if err == nil && s.expire != 0 {
 		s.doExpire(s.expire, key, v)
 	}
 	return r, err
+}
+
+func (s *LazyMap) Drop(key string) {
+	s.mux.Lock()
+	if v, ok := s.m[key]; ok {
+		v.Cancel()
+		delete(s.m, key)
+	}
+	s.mux.Unlock()
 }
