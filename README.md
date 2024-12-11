@@ -27,14 +27,14 @@ import (
 )
 
 type ResponseMap struct {
-	lazymap.LazyMap
+	lazymap.LazyMap[string]
 	cl *http.Client
 }
 
 func NewResponseMap(cl *http.Client) *ResponseMap {
 	return &ResponseMap{
 		cl: cl,
-		LazyMap: lazymap.New(&lazymap.Config{
+		LazyMap: lazymap.New[string](&lazymap.Config{
 			Concurrency: 10,
 			Expire:      600 * time.Second,
 			ErrorExpire: 30 * time.Second,
@@ -53,17 +53,17 @@ func (s *ResponseMap) get(u string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return string(r), nil
+	return r, nil
 }
 
 func (s *ResponseMap) Get(u string) (string, error) {
-	v, err := s.LazyMap.Get(u, func() (interface{}, error) {
+	v, err := s.LazyMap.Get(u, func() (string, error) {
 		return s.get(u)
 	})
 	if err != nil {
 		return "", err
 	}
-	return v.(string), nil
+	return v, nil
 }
 
 func main() {

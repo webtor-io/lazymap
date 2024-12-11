@@ -1,3 +1,3 @@
 module github.com/webtor-io/lazymap
 
-go 1.17
+go 1.23

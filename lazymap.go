@@ -18,9 +18,9 @@ const (
 	Canceled
 )
 
-type LazyMap struct {
+type LazyMap[T any] struct {
 	mux            sync.RWMutex
-	m              map[string]*lazyMapItem
+	m              map[string]*lazyMapItem[T]
 	expire         time.Duration
 	errorExpire    time.Duration
 	storeErrors    bool
@@ -51,7 +51,7 @@ func (s *EvictedError) Error() string {
 	return "Evicted"
 }
 
-func New(cfg *Config) LazyMap {
+func New[T any](cfg *Config) LazyMap[T] {
 	capacity := cfg.Capacity
 	concurrency := 10
 	if cfg.Concurrency != 0 {
@@ -74,7 +74,7 @@ func New(cfg *Config) LazyMap {
 	for i := 0; i < concurrency; i++ {
 		c <- true
 	}
-	return LazyMap{
+	return LazyMap[T]{
 		c:              c,
 		expire:         expire,
 		errorExpire:    errorExpire,
@@ -84,14 +84,14 @@ func New(cfg *Config) LazyMap {
 		cleanThreshold: cleanThreshold,
 		cleanRatio:     cleanRatio,
 		evictNotInited: cfg.EvictNotInited,
-		m:              make(map[string]*lazyMapItem, capacity),
+		m:              make(map[string]*lazyMapItem[T], capacity),
 	}
 }
 
-type lazyMapItem struct {
+type lazyMapItem[T any] struct {
 	key     string
-	val     interface{}
-	f       func() (interface{}, error)
+	val     T
+	f       func() (T, error)
 	inited  bool
 	err     error
 	la      time.Time
@@ -102,14 +102,14 @@ type lazyMapItem struct {
 	running bool
 }
 
-func (s *lazyMapItem) Touch() {
+func (s *lazyMapItem[T]) Touch() {
 	if s.t != nil {
 		s.t.Reset(s.exp)
 	}
 	s.la = time.Now()
 }
 
-func (s *lazyMapItem) Cancel() {
+func (s *lazyMapItem[T]) Cancel() {
 	if s.cancel {
 		return
 	}
@@ -119,7 +119,7 @@ func (s *lazyMapItem) Cancel() {
 	s.cancel = true
 }
 
-func (s *lazyMapItem) doExpire(exp time.Duration) <-chan time.Time {
+func (s *lazyMapItem[T]) doExpire(exp time.Duration) <-chan time.Time {
 	if s.t != nil {
 		s.t.Stop()
 	}
@@ -128,7 +128,7 @@ func (s *lazyMapItem) doExpire(exp time.Duration) <-chan time.Time {
 	return s.t.C
 }
 
-func (s *lazyMapItem) Get() (interface{}, error) {
+func (s *lazyMapItem[T]) Get() (T, error) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 	s.la = time.Now()
@@ -142,7 +142,8 @@ func (s *lazyMapItem) Get() (interface{}, error) {
 	}
 	s.running = true
 	if s.cancel {
-		s.val, s.err = nil, &EvictedError{}
+		var zero T
+		s.val, s.err = zero, &EvictedError{}
 	} else {
 		s.val, s.err = s.f()
 	}
@@ -151,7 +152,7 @@ func (s *lazyMapItem) Get() (interface{}, error) {
 	return s.val, s.err
 }
 
-func (s *LazyMap) doExpire(expire time.Duration, key string, v *lazyMapItem) {
+func (s *LazyMap[T]) doExpire(expire time.Duration, key string, v *lazyMapItem[T]) {
 	c := v.doExpire(expire)
 	go func() {
 		<-c
@@ -162,7 +163,7 @@ func (s *LazyMap) doExpire(expire time.Duration, key string, v *lazyMapItem) {
 	}()
 }
 
-func (s *LazyMap) clean() {
+func (s *LazyMap[T]) clean() {
 	if s.capacity == 0 {
 		return
 	}
@@ -174,7 +175,7 @@ func (s *LazyMap) clean() {
 		return
 	}
 	s.cleaning = true
-	t := make([]*lazyMapItem, 0, len(s.m))
+	t := make([]*lazyMapItem[T], 0, len(s.m))
 	for _, v := range s.m {
 		t = append(t, v)
 	}
@@ -196,7 +197,7 @@ func (s *LazyMap) clean() {
 	s.cleaning = false
 }
 
-func (s *lazyMapItem) Status() ItemStatus {
+func (s *lazyMapItem[T]) Status() ItemStatus {
 	if s.cancel {
 		return Canceled
 	}
@@ -212,7 +213,7 @@ func (s *lazyMapItem) Status() ItemStatus {
 	return Enqueued
 }
 
-func (s *LazyMap) Status(key string) (ItemStatus, bool) {
+func (s *LazyMap[T]) Status(key string) (ItemStatus, bool) {
 	v, loaded := s.m[key]
 	if !loaded {
 		return None, false
@@ -220,7 +221,7 @@ func (s *LazyMap) Status(key string) (ItemStatus, bool) {
 	return v.Status(), true
 }
 
-func (s *LazyMap) Touch(key string) bool {
+func (s *LazyMap[T]) Touch(key string) bool {
 	v, loaded := s.m[key]
 	if loaded {
 		v.Touch()
@@ -229,7 +230,7 @@ func (s *LazyMap) Touch(key string) bool {
 	return false
 }
 
-func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, error) {
+func (s *LazyMap[T]) Get(key string, f func() (T, error)) (T, error) {
 	s.mux.RLock()
 	v, loaded := s.m[key]
 	if loaded {
@@ -243,7 +244,7 @@ func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, e
 		s.mux.Unlock()
 		return v.Get()
 	}
-	v = &lazyMapItem{
+	v = &lazyMapItem[T]{
 		key: key,
 		f:   f,
 		la:  time.Now(),
@@ -267,7 +268,7 @@ func (s *LazyMap) Get(key string, f func() (interface{}, error)) (interface{}, e
 	return r, err
 }
 
-func (s *LazyMap) Drop(key string) {
+func (s *LazyMap[T]) Drop(key string) {
 	s.mux.Lock()
 	if v, ok := s.m[key]; ok {
 		v.Cancel()
