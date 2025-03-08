@@ -13,3 +13,5 @@
 *.db
 
 tmp
+
+.idea

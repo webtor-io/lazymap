@@ -41,6 +41,20 @@ func (s *TestMap) Get(n int) (int, error) {
 	return v, nil
 }
 
+func (s *TestMap) Get2(n int, z int) (int, error) {
+	v, err := s.LazyMap.Get(fmt.Sprintf("%v", n), func() (int, error) {
+		<-time.After(s.sleep)
+		if rand.Float64() < s.er {
+			return 0, errors.New("error")
+		}
+		return z, nil
+	})
+	if err != nil {
+		return 0, nil
+	}
+	return v, nil
+}
+
 func TestStatus(t *testing.T) {
 	p := NewTestMap(&Config{}, 0, 0)
 	p.Get(1)
@@ -84,6 +98,35 @@ func TestSequental(t *testing.T) {
 	}
 	if len(p.m) != 10 {
 		t.Fatalf("len(p,m) == %v, expected %v", len(p.m), 10)
+	}
+}
+func TestExpire(t *testing.T) {
+	p := NewTestMap(&Config{
+		Concurrency: 1,
+		Expire:      10 * time.Millisecond,
+	}, 0, 0)
+	v, _ := p.Get2(1, 2)
+	if v != 2 {
+		t.Fatalf("p.Get(%v) == %v, expected %v", 2, v, 2)
+	}
+	v, _ = p.Get2(1, 5)
+	if v != 2 {
+		t.Fatalf("p.Get(%v) == %v, expected %v", 2, v, 2)
+	}
+	<-time.After(5 * time.Millisecond)
+	v, _ = p.Get2(1, 5)
+	if v != 2 {
+		t.Fatalf("p.Get(%v) == %v, expected %v", 2, v, 2)
+	}
+	<-time.After(10 * time.Millisecond)
+	v, _ = p.Get2(1, 5)
+	if v != 5 {
+		t.Fatalf("p.Get(%v) == %v, expected %v", 5, v, 5)
+	}
+	<-time.After(5 * time.Millisecond)
+	v, _ = p.Get2(1, 7)
+	if v != 5 {
+		t.Fatalf("p.Get(%v) == %v, expected %v", 5, v, 5)
 	}
 }
 
