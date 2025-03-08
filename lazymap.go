@@ -31,6 +31,7 @@ type LazyMap[T any] struct {
 	cleanRatio     float64
 	cleaning       bool
 	evictNotInited bool
+	keepAlive      bool
 }
 
 type Config struct {
@@ -43,6 +44,7 @@ type Config struct {
 	CleanThreshold float64
 	CleanRatio     float64
 	EvictNotInited bool
+	KeepAlive      bool
 }
 
 type EvictedError struct{}
@@ -84,25 +86,30 @@ func New[T any](cfg *Config) LazyMap[T] {
 		cleanThreshold: cleanThreshold,
 		cleanRatio:     cleanRatio,
 		evictNotInited: cfg.EvictNotInited,
+		keepAlive:      cfg.KeepAlive,
 		m:              make(map[string]*lazyMapItem[T], capacity),
 	}
 }
 
 type lazyMapItem[T any] struct {
-	key     string
-	val     T
-	f       func() (T, error)
-	inited  bool
-	err     error
-	la      time.Time
-	mux     sync.Mutex
-	cancel  bool
-	t       *time.Timer
-	exp     time.Duration
-	running bool
+	key       string
+	val       T
+	f         func() (T, error)
+	inited    bool
+	err       error
+	la        time.Time
+	mux       sync.Mutex
+	cancel    bool
+	t         *time.Timer
+	exp       time.Duration
+	keepAlive bool
+	running   bool
 }
 
 func (s *lazyMapItem[T]) Touch() {
+	if !s.keepAlive {
+		return
+	}
 	if s.t != nil {
 		s.t.Reset(s.exp)
 	}
@@ -121,6 +128,9 @@ func (s *lazyMapItem[T]) Cancel() {
 
 func (s *lazyMapItem[T]) doExpire(exp time.Duration) <-chan time.Time {
 	if s.t != nil {
+		if !s.keepAlive {
+			return nil
+		}
 		s.t.Stop()
 	}
 	s.exp = exp
@@ -154,6 +164,9 @@ func (s *lazyMapItem[T]) Get() (T, error) {
 
 func (s *LazyMap[T]) doExpire(expire time.Duration, key string, v *lazyMapItem[T]) {
 	c := v.doExpire(expire)
+	if c == nil {
+		return
+	}
 	go func() {
 		<-c
 		s.mux.Lock()
@@ -222,6 +235,9 @@ func (s *LazyMap[T]) Status(key string) (ItemStatus, bool) {
 }
 
 func (s *LazyMap[T]) Touch(key string) bool {
+	if !s.keepAlive {
+		return false
+	}
 	v, loaded := s.m[key]
 	if loaded {
 		v.Touch()
@@ -245,9 +261,10 @@ func (s *LazyMap[T]) Get(key string, f func() (T, error)) (T, error) {
 		return v.Get()
 	}
 	v = &lazyMapItem[T]{
-		key: key,
-		f:   f,
-		la:  time.Now(),
+		key:       key,
+		f:         f,
+		la:        time.Now(),
+		keepAlive: s.keepAlive,
 	}
 	s.m[key] = v
 	s.clean()
