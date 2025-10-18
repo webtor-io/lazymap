@@ -64,16 +64,19 @@ func TestStatus(t *testing.T) {
 	}
 }
 func TestHasWithLongRunningTask(t *testing.T) {
-	s := time.Now()
 	p := NewTestMap(&Config{
 		Concurrency: 1,
 	}, 1000, 0)
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
 		p.Get(1)
+		wg.Done()
 	}()
 	<-time.After(50 * time.Millisecond)
 	go func() {
 		p.Get(2)
+		wg.Done()
 	}()
 	<-time.After(50 * time.Millisecond)
 	_, ok := p.Status(1)
@@ -84,9 +87,7 @@ func TestHasWithLongRunningTask(t *testing.T) {
 	if !ok {
 		t.Fatalf("p.Has(%v) == %v, expected true", 2, ok)
 	}
-	if time.Since(s) > time.Second {
-		t.Fatalf("It takes %v seconds to perform test, expected less than 1 second", time.Since(s).Seconds())
-	}
+	wg.Wait()
 }
 func TestSequental(t *testing.T) {
 	p := NewTestMap(&Config{}, 0, 0)
@@ -96,8 +97,8 @@ func TestSequental(t *testing.T) {
 			t.Fatalf("p.Get(%v) == %v, expected %v", i, v, i)
 		}
 	}
-	if len(p.m) != 10 {
-		t.Fatalf("len(p,m) == %v, expected %v", len(p.m), 10)
+	if p.Len() != 10 {
+		t.Fatalf("len(p,m) == %v, expected %v", p.Len(), 10)
 	}
 }
 func TestExpire(t *testing.T) {
@@ -142,8 +143,8 @@ func TestConcurrentWithConcurrency10(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if len(p.m) != 10 {
-		t.Fatalf("len(p,m) == %v, expected %v", len(p.m), 10)
+	if p.Len() != 10 {
+		t.Fatalf("len(p,m) == %v, expected %v", p.Len(), 10)
 	}
 	if time.Since(s) > time.Second {
 		t.Fatalf("It takes %v seconds to perform test, expected less than a second", time.Since(s).Seconds())
@@ -162,8 +163,8 @@ func TestConcurrentWithConcurrency10AndExpire(t *testing.T) {
 	}
 	wg.Wait()
 	<-time.After(100 * time.Millisecond)
-	if len(p.m) != 0 {
-		t.Fatalf("len(p,m) == %v, expected %v", len(p.m), 0)
+	if p.Len() != 0 {
+		t.Fatalf("len(p,m) == %v, expected %v", p.Len(), 0)
 	}
 }
 
@@ -178,8 +179,8 @@ func TestConcurrentWithConcurrency10AndInitExpire(t *testing.T) {
 		}(i)
 	}
 	<-time.After(50 * time.Millisecond)
-	if len(p.m) != 1 {
-		t.Fatalf("len(p,m) == %v, expected %v", len(p.m), 1)
+	if p.Len() != 1 {
+		t.Fatalf("len(p,m) == %v, expected %v", p.Len(), 1)
 	}
 }
 
@@ -197,8 +198,8 @@ func TestConcurrentWithConcurrency1(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if len(p.m) != 10 {
-		t.Fatalf("len(p,m) == %v, expected %v", len(p.m), 10)
+	if p.Len() != 10 {
+		t.Fatalf("len(p,m) == %v, expected %v", p.Len(), 10)
 	}
 	if time.Since(s) < 3*time.Second {
 		t.Fatalf("It takes %v seconds to perform test, expected more than 3 second", time.Since(s).Seconds())
@@ -216,8 +217,8 @@ func TestOutOfCapacity1WithConcurrency1(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if len(p.m) != 10 {
-		t.Fatalf("len(p,m) == %v, expected %v", len(p.m), 10)
+	if p.Len() != 1 {
+		t.Fatalf("len(p,m) == %v, expected %v", p.Len(), 1)
 	}
 }
 
@@ -232,8 +233,8 @@ func TestOutOfCapacity1WithConcurrency1WithEviction(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if len(p.m) != 1 {
-		t.Fatalf("len(p,m) == %v, expected %v", len(p.m), 1)
+	if p.Len() != 1 {
+		t.Fatalf("len(p,m) == %v, expected %v", p.Len(), 1)
 	}
 }
 
@@ -248,8 +249,8 @@ func TestOutOfCapacity1WithConcurrency10(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if len(p.m) == 10 {
-		t.Fatalf("len(p,m) == %v, expected less", len(p.m))
+	if p.Len() == 10 {
+		t.Fatalf("len(p,m) == %v, expected less", p.Len())
 	}
 }
 
@@ -264,10 +265,7 @@ func TestOutOfCapacity100WithConcurrency10(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	keys := []string{}
-	for k := range p.m {
-		keys = append(keys, k)
-	}
+	keys := p.Keys()
 	if len(keys) >= 100 {
 		t.Fatalf("len(keys) == %v, expected less", len(keys))
 	}

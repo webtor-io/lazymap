@@ -103,6 +103,8 @@ type lazyMapItem[T any] struct {
 }
 
 func (s *lazyMapItem[T]) Touch() {
+	s.mux.Lock()
+	defer s.mux.Unlock()
 	if s.t != nil {
 		s.t.Reset(s.exp)
 	}
@@ -110,6 +112,8 @@ func (s *lazyMapItem[T]) Touch() {
 }
 
 func (s *lazyMapItem[T]) Cancel() {
+	s.mux.Lock()
+	defer s.mux.Unlock()
 	if s.cancel {
 		return
 	}
@@ -120,6 +124,8 @@ func (s *lazyMapItem[T]) Cancel() {
 }
 
 func (s *lazyMapItem[T]) doExpire(exp time.Duration) <-chan time.Time {
+	s.mux.Lock()
+	defer s.mux.Unlock()
 	if s.t != nil {
 		s.t.Stop()
 	}
@@ -180,12 +186,22 @@ func (s *LazyMap[T]) clean() {
 		t = append(t, v)
 	}
 	sort.Slice(t, func(i, j int) bool {
-		return t[i].la.Before(t[j].la)
+		t[i].mux.Lock()
+		t[j].mux.Lock()
+		iLa := t[i].la
+		jLa := t[j].la
+		t[j].mux.Unlock()
+		t[i].mux.Unlock()
+		return iLa.Before(jLa)
 	})
 	cq := int(math.Ceil(s.cleanRatio * float64(s.capacity)))
 	dc := 0
 	for i := 0; i < len(t); i++ {
-		if !t[i].running && (t[i].inited || s.evictNotInited) {
+		t[i].mux.Lock()
+		running := t[i].running
+		inited := t[i].inited
+		t[i].mux.Unlock()
+		if !running && (inited || s.evictNotInited) {
 			t[i].Cancel()
 			delete(s.m, t[i].key)
 			dc++
@@ -198,6 +214,8 @@ func (s *LazyMap[T]) clean() {
 }
 
 func (s *lazyMapItem[T]) Status() ItemStatus {
+	s.mux.Lock()
+	defer s.mux.Unlock()
 	if s.cancel {
 		return Canceled
 	}
@@ -214,7 +232,9 @@ func (s *lazyMapItem[T]) Status() ItemStatus {
 }
 
 func (s *LazyMap[T]) Status(key string) (ItemStatus, bool) {
+	s.mux.RLock()
 	v, loaded := s.m[key]
+	s.mux.RUnlock()
 	if !loaded {
 		return None, false
 	}
@@ -222,7 +242,9 @@ func (s *LazyMap[T]) Status(key string) (ItemStatus, bool) {
 }
 
 func (s *LazyMap[T]) Touch(key string) bool {
+	s.mux.RLock()
 	v, loaded := s.m[key]
+	s.mux.RUnlock()
 	if loaded {
 		v.Touch()
 		return true
@@ -275,4 +297,20 @@ func (s *LazyMap[T]) Drop(key string) {
 		delete(s.m, key)
 	}
 	s.mux.Unlock()
+}
+
+func (s *LazyMap[T]) Len() int {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	return len(s.m)
+}
+
+func (s *LazyMap[T]) Keys() []string {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	keys := make([]string, 0, len(s.m))
+	for k := range s.m {
+		keys = append(keys, k)
+	}
+	return keys
 }
