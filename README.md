@@ -34,7 +34,7 @@ type ResponseMap struct {
 func NewResponseMap(cl *http.Client) *ResponseMap {
 	return &ResponseMap{
 		cl: cl,
-  LazyMap: lazymap.New[string](&lazymap.Config{
+        LazyMap: lazymap.New[string](&lazymap.Config{
             Concurrency: 10,
             Expire:      600 * time.Second,
             ErrorExpire: 30 * time.Second,
