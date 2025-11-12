@@ -19,6 +19,10 @@ const (
 )
 
 type LazyMap[T any] struct {
+	// noCopy prevents accidental copying of the LazyMap, which would duplicate
+	// the mutex and cause data races or fatal errors like concurrent map writes.
+	// See https://github.com/golang/go/issues/8005
+	noCopy         noCopy
 	mux            sync.RWMutex
 	m              map[string]*lazyMapItem[T]
 	expire         time.Duration
@@ -32,6 +36,14 @@ type LazyMap[T any] struct {
 	cleaning       bool
 	evictNotInited bool
 }
+
+// noCopy may be embedded into structs which must not be copied
+// after the first use. See `go vet -copylocks` and `-copylocks` analyzer.
+// The Lock method does nothing but fulfills the analyzer's expectations.
+type noCopy struct{}
+
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
 
 type Config struct {
 	Concurrency    int
@@ -51,7 +63,7 @@ func (s *EvictedError) Error() string {
 	return "Evicted"
 }
 
-func New[T any](cfg *Config) LazyMap[T] {
+func New[T any](cfg *Config) *LazyMap[T] {
 	capacity := cfg.Capacity
 	concurrency := 10
 	if cfg.Concurrency != 0 {
@@ -74,7 +86,7 @@ func New[T any](cfg *Config) LazyMap[T] {
 	for i := 0; i < concurrency; i++ {
 		c <- true
 	}
-	return LazyMap[T]{
+	return &LazyMap[T]{
 		c:              c,
 		expire:         expire,
 		errorExpire:    errorExpire,

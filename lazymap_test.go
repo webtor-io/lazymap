@@ -12,7 +12,7 @@ import (
 type TestMap struct {
 	sleep time.Duration
 	er    float64
-	LazyMap[int]
+	*LazyMap[int]
 }
 
 func NewTestMap(c *Config, sleep int, er float64) *TestMap {
