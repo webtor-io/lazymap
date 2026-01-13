@@ -89,6 +89,196 @@ func TestHasWithLongRunningTask(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestStatusNonBlockingDuringGet verifies that Status() doesn't block when Get() is running
+func TestStatusNonBlockingDuringGet(t *testing.T) {
+	lm := New[string](&Config{
+		Concurrency: 2, // Allow concurrent execution
+	})
+
+	// Use a channel to signal when the function starts executing
+	started := make(chan bool)
+
+	// Start a long-running Get operation
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		lm.Get("key1", func() (string, error) {
+			started <- true
+			time.Sleep(2 * time.Second) // Long enough to ensure we check while running
+			return "value1", nil
+		})
+	}()
+
+	// Wait for the function to actually start executing
+	<-started
+
+	// Give a tiny bit of time to ensure running flag is set
+	time.Sleep(10 * time.Millisecond)
+
+	// Status should not block and should complete quickly
+	start := time.Now()
+	status, ok := lm.Status("key1")
+	elapsed := time.Since(start)
+
+	if !ok {
+		t.Fatalf("Expected Status to find key1")
+	}
+
+	if status != Running {
+		t.Fatalf("Expected status Running, got %v", status)
+	}
+
+	// Status should complete in well under 100ms (it should be nearly instant)
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("Status() took too long (%v), suggesting it blocked on Get()", elapsed)
+	}
+
+	wg.Wait()
+}
+
+// TestStatusTransitionsDuringGet verifies Status correctly reports state transitions
+func TestStatusTransitionsDuringGet(t *testing.T) {
+	lm := New[int](&Config{
+		Concurrency: 2,
+	})
+
+	// Check status before Get - should not exist
+	status, ok := lm.Status("key1")
+	if ok {
+		t.Fatalf("Expected key1 to not exist, but got status %v", status)
+	}
+	if status != None {
+		t.Fatalf("Expected status None for non-existent key, got %v", status)
+	}
+
+	// Use a channel to signal when the function starts executing
+	started := make(chan bool)
+
+	// Start a long-running Get operation
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		lm.Get("key1", func() (int, error) {
+			started <- true
+			time.Sleep(2 * time.Second) // Long enough to ensure we check while running
+			return 42, nil
+		})
+	}()
+
+	// Wait for the function to actually start executing
+	<-started
+
+	// Give a tiny bit of time to ensure running flag is set
+	time.Sleep(10 * time.Millisecond)
+
+	// Check status is Running
+	status, ok = lm.Status("key1")
+	if !ok {
+		t.Fatalf("Expected key1 to exist")
+	}
+	if status != Running {
+		t.Fatalf("Expected status Running during Get execution, got %v", status)
+	}
+
+	// Wait for Get to complete
+	wg.Wait()
+
+	// Check status after completion - should be Done
+	status, ok = lm.Status("key1")
+	if !ok {
+		t.Fatalf("Expected key1 to still exist after Get completes")
+	}
+	if status != Done {
+		t.Fatalf("Expected status Done after successful Get, got %v", status)
+	}
+}
+
+// TestStatusWithMultipleConcurrentGets verifies Status works correctly with multiple concurrent Gets
+func TestStatusWithMultipleConcurrentGets(t *testing.T) {
+	lm := New[int](&Config{
+		Concurrency: 3,
+	})
+
+	var wg sync.WaitGroup
+	numGoroutines := 10
+
+	// Start multiple Get operations
+	wg.Add(numGoroutines)
+	for i := 0; i < numGoroutines; i++ {
+		go func(n int) {
+			defer wg.Done()
+			lm.Get(fmt.Sprintf("key%d", n), func() (int, error) {
+				time.Sleep(100 * time.Millisecond)
+				return n, nil
+			})
+		}(i)
+	}
+
+	// Give Gets time to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Check Status for all keys - should not block or deadlock
+	statusCheckStart := time.Now()
+	for i := 0; i < numGoroutines; i++ {
+		status, ok := lm.Status(fmt.Sprintf("key%d", i))
+		if !ok {
+			t.Fatalf("Expected key%d to exist", i)
+		}
+		// Status can be Enqueued (waiting for semaphore), Running, or Done
+		if status != Enqueued && status != Running && status != Done {
+			t.Fatalf("Expected key%d status to be Enqueued, Running or Done, got %v", i, status)
+		}
+	}
+	statusCheckElapsed := time.Since(statusCheckStart)
+
+	// All Status checks should complete quickly (well under 1 second)
+	// This is the key test - Status should not block even if Get is running
+	if statusCheckElapsed > 500*time.Millisecond {
+		t.Fatalf("Status checks took too long (%v), suggesting blocking occurred", statusCheckElapsed)
+	}
+
+	wg.Wait()
+
+	// Verify all are Done after completion
+	for i := 0; i < numGoroutines; i++ {
+		status, ok := lm.Status(fmt.Sprintf("key%d", i))
+		if !ok {
+			t.Fatalf("Expected key%d to exist after completion", i)
+		}
+		if status != Done {
+			t.Fatalf("Expected key%d status to be Done, got %v", i, status)
+		}
+	}
+}
+
+// TestStatusWithFailedGet verifies Status correctly reports Failed status
+func TestStatusWithFailedGet(t *testing.T) {
+	lm := New[int](&Config{
+		Concurrency: 1,
+		StoreErrors: true, // Store errors so we can check Failed status
+	})
+
+	// Execute a Get that will fail
+	_, err := lm.Get("key1", func() (int, error) {
+		return 0, errors.New("intentional error")
+	})
+
+	if err == nil {
+		t.Fatalf("Expected Get to return an error")
+	}
+
+	// Check status - should be Failed
+	status, ok := lm.Status("key1")
+	if !ok {
+		t.Fatalf("Expected key1 to exist after failed Get")
+	}
+	if status != Failed {
+		t.Fatalf("Expected status Failed after error, got %v", status)
+	}
+}
 func TestSequental(t *testing.T) {
 	p := NewTestMap(&Config{}, 0, 0)
 	for i := 0; i < 10; i++ {

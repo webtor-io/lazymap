@@ -107,7 +107,7 @@ type lazyMapItem[T any] struct {
 	inited  bool
 	err     error
 	la      time.Time
-	mux     sync.Mutex
+	mux     sync.RWMutex
 	cancel  bool
 	t       *time.Timer
 	exp     time.Duration
@@ -148,9 +148,9 @@ func (s *lazyMapItem[T]) doExpire(exp time.Duration) <-chan time.Time {
 
 func (s *lazyMapItem[T]) Get() (T, error) {
 	s.mux.Lock()
-	defer s.mux.Unlock()
 	s.la = time.Now()
 	if s.inited {
+		s.mux.Unlock()
 		return s.val, s.err
 	}
 
@@ -159,15 +159,28 @@ func (s *lazyMapItem[T]) Get() (T, error) {
 		s.t = nil
 	}
 	s.running = true
-	if s.cancel {
+	canceled := s.cancel
+	f := s.f
+	s.mux.Unlock()
+
+	// Execute the function without holding the lock
+	// This allows Status() to check the running flag
+	var val T
+	var err error
+	if canceled {
 		var zero T
-		s.val, s.err = zero, &EvictedError{}
+		val, err = zero, &EvictedError{}
 	} else {
-		s.val, s.err = s.f()
+		val, err = f()
 	}
+
+	s.mux.Lock()
+	s.val = val
+	s.err = err
 	s.inited = true
 	s.running = false
-	return s.val, s.err
+	s.mux.Unlock()
+	return val, err
 }
 
 func (s *LazyMap[T]) doExpire(expire time.Duration, key string, v *lazyMapItem[T]) {
@@ -198,21 +211,21 @@ func (s *LazyMap[T]) clean() {
 		t = append(t, v)
 	}
 	sort.Slice(t, func(i, j int) bool {
-		t[i].mux.Lock()
-		t[j].mux.Lock()
+		t[i].mux.RLock()
+		t[j].mux.RLock()
 		iLa := t[i].la
 		jLa := t[j].la
-		t[j].mux.Unlock()
-		t[i].mux.Unlock()
+		t[j].mux.RUnlock()
+		t[i].mux.RUnlock()
 		return iLa.Before(jLa)
 	})
 	cq := int(math.Ceil(s.cleanRatio * float64(s.capacity)))
 	dc := 0
 	for i := 0; i < len(t); i++ {
-		t[i].mux.Lock()
+		t[i].mux.RLock()
 		running := t[i].running
 		inited := t[i].inited
-		t[i].mux.Unlock()
+		t[i].mux.RUnlock()
 		if !running && (inited || s.evictNotInited) {
 			t[i].Cancel()
 			delete(s.m, t[i].key)
@@ -226,8 +239,8 @@ func (s *LazyMap[T]) clean() {
 }
 
 func (s *lazyMapItem[T]) Status() ItemStatus {
-	s.mux.Lock()
-	defer s.mux.Unlock()
+	s.mux.RLock()
+	defer s.mux.RUnlock()
 	if s.cancel {
 		return Canceled
 	}
@@ -284,7 +297,6 @@ func (s *LazyMap[T]) Get(key string, f func() (T, error)) (T, error) {
 		la:  time.Now(),
 	}
 	s.m[key] = v
-	s.clean()
 	s.mux.Unlock()
 	if s.initExpire != 0 {
 		s.doExpire(s.initExpire, key, v)
@@ -299,6 +311,9 @@ func (s *LazyMap[T]) Get(key string, f func() (T, error)) (T, error) {
 	} else if err == nil && s.expire != 0 {
 		s.doExpire(s.expire, key, v)
 	}
+	s.mux.Lock()
+	s.clean()
+	s.mux.Unlock()
 	return r, err
 }
 
