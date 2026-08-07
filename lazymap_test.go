@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -520,5 +521,40 @@ func BenchmarkCapacity1000WConcurrency100ExpireAndInitExpire(b *testing.B) {
 			wg.Done()
 		}()
 	}
+	wg.Wait()
+}
+
+// Status and Touch used to read the map, and the item's fields, without any
+// lock. Under -race this reproduces immediately against the unfixed code.
+func TestStatusAndTouchAreRaceFree(t *testing.T) {
+	m := New[int](&Config{Expire: time.Minute, Capacity: 64})
+	const keys = 16
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				k := strconv.Itoa((g*7 + i) % keys)
+				switch i % 3 {
+				case 0:
+					_, _ = m.Get(k, func() (int, error) { return i, nil })
+				case 1:
+					_, _ = m.Status(k)
+				default:
+					m.Touch(k)
+				}
+			}
+		}(g)
+	}
+	time.Sleep(150 * time.Millisecond)
+	close(stop)
 	wg.Wait()
 }
