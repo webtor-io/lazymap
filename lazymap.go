@@ -101,17 +101,23 @@ func New[T any](cfg *Config) *LazyMap[T] {
 }
 
 type lazyMapItem[T any] struct {
-	key     string
-	val     T
-	f       func() (T, error)
-	inited  bool
-	err     error
-	la      time.Time
-	mux     sync.RWMutex
-	cancel  bool
-	t       *time.Timer
-	exp     time.Duration
+	key    string
+	val    T
+	f      func() (T, error)
+	inited bool
+	err    error
+	la     time.Time
+	mux    sync.RWMutex
+	cancel bool
+	t      *time.Timer
+	exp    time.Duration
+	// running + done implement singleflight: the first Get sets running,
+	// creates done and executes f outside the lock; every concurrent Get on
+	// the same item waits on done instead of executing f again. done is
+	// closed exactly once, by the executing goroutine, after val/err/inited
+	// are published under the lock.
 	running bool
+	done    chan struct{}
 }
 
 func (s *lazyMapItem[T]) Touch() {
@@ -146,6 +152,11 @@ func (s *lazyMapItem[T]) doExpire(exp time.Duration) <-chan time.Time {
 	return s.t.C
 }
 
+// Get returns the item's value, executing f exactly once no matter how many
+// goroutines arrive concurrently: the first one runs f outside the lock (so
+// Status() stays readable meanwhile), the rest block on done and read the
+// published result. Calling Get for a key from inside that key's own f
+// deadlocks — same as any singleflight.
 func (s *lazyMapItem[T]) Get() (T, error) {
 	s.mux.Lock()
 	s.la = time.Now()
@@ -154,11 +165,25 @@ func (s *lazyMapItem[T]) Get() (T, error) {
 		return s.val, s.err
 	}
 
+	if s.running {
+		// f is already executing on another goroutine. Waiting here — rather
+		// than running f again — is the singleflight guarantee this map
+		// exists to provide.
+		done := s.done
+		s.mux.Unlock()
+		<-done
+		s.mux.RLock()
+		val, err := s.val, s.err
+		s.mux.RUnlock()
+		return val, err
+	}
+
 	if s.t != nil {
 		s.t.Stop()
 		s.t = nil
 	}
 	s.running = true
+	s.done = make(chan struct{})
 	canceled := s.cancel
 	f := s.f
 	s.mux.Unlock()
@@ -179,6 +204,7 @@ func (s *lazyMapItem[T]) Get() (T, error) {
 	s.err = err
 	s.inited = true
 	s.running = false
+	close(s.done)
 	s.mux.Unlock()
 	return val, err
 }

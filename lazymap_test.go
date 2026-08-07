@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -557,4 +558,69 @@ func TestStatusAndTouchAreRaceFree(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+// Singleflight regression: N concurrent Gets on one cold key must execute f
+// exactly once, and every caller must receive its result. Broken between
+// 2026-01 (f moved outside the item lock for Status visibility, with nothing
+// left to make concurrent callers wait) and this test's introduction: 20
+// concurrent Gets executed f 20 times.
+func TestGetConcurrentSingleflight(t *testing.T) {
+	m := New[int](&Config{Expire: time.Minute})
+	var calls int64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make([]int, 20)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			v, err := m.Get("k", func() (int, error) {
+				atomic.AddInt64(&calls, 1)
+				time.Sleep(50 * time.Millisecond)
+				return 42, nil
+			})
+			if err != nil {
+				t.Errorf("Get: %v", err)
+			}
+			results[i] = v
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	if n := atomic.LoadInt64(&calls); n != 1 {
+		t.Fatalf("f executed %d times for one key, want 1", n)
+	}
+	for i, v := range results {
+		if v != 42 {
+			t.Fatalf("caller %d got %d, want 42", i, v)
+		}
+	}
+}
+
+// Concurrent callers must also share a single failing execution and all see
+// its error.
+func TestGetConcurrentSingleflightError(t *testing.T) {
+	m := New[int](&Config{Expire: time.Minute, StoreErrors: false})
+	var calls int64
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := m.Get("k", func() (int, error) {
+				atomic.AddInt64(&calls, 1)
+				time.Sleep(20 * time.Millisecond)
+				return 0, errors.New("boom")
+			})
+			if err == nil {
+				t.Error("expected the shared error, got nil")
+			}
+		}()
+	}
+	wg.Wait()
+	if n := atomic.LoadInt64(&calls); n != 1 {
+		t.Fatalf("f executed %d times for one key, want 1", n)
+	}
 }
