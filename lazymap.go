@@ -129,6 +129,10 @@ func (s *lazyMapItem[T]) Touch() {
 	s.la = time.Now()
 }
 
+// Cancel stops the expiry timer and marks the item dead. Dropping the timer
+// reference is what lets an evicted item — and the value it holds — become
+// garbage: the timer is the only thing still pointing at the item once the map
+// entry is gone.
 func (s *lazyMapItem[T]) Cancel() {
 	s.mux.Lock()
 	defer s.mux.Unlock()
@@ -137,19 +141,32 @@ func (s *lazyMapItem[T]) Cancel() {
 	}
 	if s.t != nil {
 		s.t.Stop()
+		s.t = nil
 	}
 	s.cancel = true
 }
 
-func (s *lazyMapItem[T]) doExpire(exp time.Duration) <-chan time.Time {
+// setExpire (re)arms the expiry timer to fire f after exp.
+//
+// time.AfterFunc rather than a goroutine parked on a timer channel: a pending
+// AfterFunc timer costs no goroutine, and Stop() on it guarantees f will not
+// start if it had not already. The parked-goroutine shape leaked one goroutine
+// and pinned the item's value on every Cancel() — Stop() made the channel it
+// was waiting on unfireable, so it never woke and never dropped its reference.
+//
+// A canceled item is never re-armed: it is out of the map for good, and a timer
+// on it would only keep it alive.
+func (s *lazyMapItem[T]) setExpire(exp time.Duration, f func()) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
+	if s.cancel {
+		return
+	}
 	if s.t != nil {
 		s.t.Stop()
 	}
 	s.exp = exp
-	s.t = time.NewTimer(exp)
-	return s.t.C
+	s.t = time.AfterFunc(exp, f)
 }
 
 // Get returns the item's value, executing f exactly once no matter how many
@@ -210,14 +227,17 @@ func (s *lazyMapItem[T]) Get() (T, error) {
 }
 
 func (s *LazyMap[T]) doExpire(expire time.Duration, key string, v *lazyMapItem[T]) {
-	c := v.doExpire(expire)
-	go func() {
-		<-c
+	v.setExpire(expire, func() {
 		s.mux.Lock()
 		v.Cancel()
-		delete(s.m, key)
+		// Only this item's own entry may be dropped: after an eviction or a
+		// Drop a fresh item can already live under the same key, and a late
+		// timer must not take it with it.
+		if cur, ok := s.m[key]; ok && cur == v {
+			delete(s.m, key)
+		}
 		s.mux.Unlock()
-	}()
+	})
 }
 
 func (s *LazyMap[T]) clean() {

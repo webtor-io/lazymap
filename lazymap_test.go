@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -622,5 +623,257 @@ func TestGetConcurrentSingleflightError(t *testing.T) {
 	wg.Wait()
 	if n := atomic.LoadInt64(&calls); n != 1 {
 		t.Fatalf("f executed %d times for one key, want 1", n)
+	}
+}
+
+// Capacity eviction must release the evicted item, its goroutine and its value.
+//
+// Before the fix, LazyMap.doExpire parked one goroutine per item on the item's
+// timer channel, and Cancel() (called by clean() on capacity eviction and by
+// Drop) only Stop()ped that timer — so the channel never fired, the goroutine
+// never woke, and it kept the evicted item and its value reachable forever.
+// TTL expiry was the only path that released anything. Measured against
+// a258d93 at capacity 16 with 200 inserts: len=14, goroutines=201.
+func TestEvictionReleasesGoroutines(t *testing.T) {
+	before := runtime.NumGoroutine()
+	m := New[int](&Config{Concurrency: 1, Capacity: 16, Expire: time.Hour})
+	for i := 0; i < 200; i++ {
+		if _, err := m.Get(strconv.Itoa(i), func() (int, error) { return i, nil }); err != nil {
+			t.Fatalf("Get(%d): %v", i, err)
+		}
+	}
+	if l := m.Len(); l > 16 {
+		t.Fatalf("Len() == %v after 200 inserts at capacity 16, expected at most 16", l)
+	}
+	// Anything on its way out gets a moment to finish; a leak does not go away.
+	limit := before + 20
+	after := runtime.NumGoroutine()
+	for deadline := time.Now().Add(2 * time.Second); after > limit && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		after = runtime.NumGoroutine()
+	}
+	t.Logf("goroutines: before=%v after=%v len=%v", before, after, m.Len())
+	if after > limit {
+		t.Fatalf("goroutines: %v before, %v after 200 inserts at capacity 16 (expected at most %v) — evicted items are still pinned", before, after, limit)
+	}
+	runtime.KeepAlive(m)
+}
+
+// The memory half of the same bug: at capacity 16 only ~16 MiB of 1 MiB values
+// may survive a forced GC. Before the fix the whole 200 MiB stayed resident.
+//
+// Measured as the heap the map itself retains (after minus before), not as an
+// absolute figure: under -race the baseline drifts by tens of MiB between
+// -count iterations, and the difference cancels that out.
+func TestEvictionReleasesMemory(t *testing.T) {
+	const payload = 1 << 20
+	before := heapAlloc()
+	m := New[[]byte](&Config{Concurrency: 1, Capacity: 16, Expire: time.Hour})
+	for i := 0; i < 200; i++ {
+		if _, err := m.Get(strconv.Itoa(i), func() ([]byte, error) {
+			b := make([]byte, payload)
+			b[0] = byte(i)
+			return b, nil
+		}); err != nil {
+			t.Fatalf("Get(%d): %v", i, err)
+		}
+	}
+	after := heapAlloc()
+	retained := int64(after) - int64(before)
+	t.Logf("heap: before=%v MiB after=%v MiB retained=%v MiB len=%v",
+		before>>20, after>>20, retained>>20, m.Len())
+	// 16 live entries are 16 MiB; the threshold leaves 4x headroom and still
+	// separates 16 MiB retained from the 200 MiB the leak retained.
+	const maxRetained = 64 << 20
+	if retained > maxRetained {
+		t.Fatalf("map retains %v MiB after 200 inserts of 1 MiB at capacity 16, expected at most %v MiB — evicted values are still pinned",
+			retained>>20, maxRetained>>20)
+	}
+	runtime.KeepAlive(m)
+}
+
+// heapAlloc reports live heap bytes. Two collections: the first frees, the
+// second settles what the first made unreachable.
+func heapAlloc() uint64 {
+	runtime.GC()
+	runtime.GC()
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	return ms.HeapAlloc
+}
+
+// Drop reaches the same Cancel() and must release as much as eviction does:
+// before the fix each dropped key also left a goroutine parked on a stopped
+// timer, holding the dropped item.
+func TestDropReleasesGoroutines(t *testing.T) {
+	before := runtime.NumGoroutine()
+	m := New[int](&Config{Concurrency: 1, Expire: time.Hour})
+	for i := 0; i < 200; i++ {
+		k := strconv.Itoa(i)
+		if _, err := m.Get(k, func() (int, error) { return i, nil }); err != nil {
+			t.Fatalf("Get(%d): %v", i, err)
+		}
+		m.Drop(k)
+	}
+	if l := m.Len(); l != 0 {
+		t.Fatalf("Len() == %v after dropping every key, expected 0", l)
+	}
+	limit := before + 20
+	after := runtime.NumGoroutine()
+	for deadline := time.Now().Add(2 * time.Second); after > limit && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		after = runtime.NumGoroutine()
+	}
+	t.Logf("goroutines: before=%v after=%v", before, after)
+	if after > limit {
+		t.Fatalf("goroutines: %v before, %v after 200 Get+Drop (expected at most %v) — dropped items are still pinned", before, after, limit)
+	}
+	runtime.KeepAlive(m)
+}
+
+// An expiry timer belongs to one item, not to a key. Get's tail re-arms the
+// timer after f returns, even when the item was canceled and removed while f
+// ran (Drop cancels running items); that timer must never take out the fresh
+// item that has since claimed the key. Before the fix the re-armed timer
+// deleted by key, unconditionally.
+func TestStaleTimerDoesNotDropTheFreshItem(t *testing.T) {
+	m := New[int](&Config{
+		Concurrency: 1,
+		ErrorExpire: 50 * time.Millisecond,
+		Expire:      10 * time.Second,
+		StoreErrors: true,
+	})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = m.Get("k", func() (int, error) {
+			<-release
+			return 0, errors.New("boom")
+		})
+	}()
+	for {
+		if _, ok := m.Status("k"); ok {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	m.Drop("k") // cancels and removes the item while f is still running
+	close(release)
+	<-done // Get's tail now re-arms ErrorExpire on the canceled item
+
+	if v, err := m.Get("k", func() (int, error) { return 42, nil }); err != nil || v != 42 {
+		t.Fatalf("Get after drop == (%v, %v), expected (42, nil)", v, err)
+	}
+	// Well past the moment the stale ErrorExpire timer would have fired, and
+	// far short of the fresh item's own 10s expiry.
+	time.Sleep(200 * time.Millisecond)
+	if _, ok := m.Status("k"); !ok {
+		t.Fatalf("the fresh item was removed by the dropped item's stale expiry timer")
+	}
+}
+
+// Get's tail arms the expiry timer after f returns — including for an item that
+// was canceled while f ran (Drop does that). Arming it would keep the dead item,
+// and the value f just produced, alive for a whole expiry period; at Expire:
+// time.Hour that is indistinguishable from the leak this fix is about.
+func TestDropWhileRunningReleasesTheValue(t *testing.T) {
+	const payload = 1 << 20
+	const n = 50
+	m := New[[]byte](&Config{Concurrency: n, Expire: time.Hour})
+	before := heapAlloc()
+
+	var started int64
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		k := strconv.Itoa(i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = m.Get(k, func() ([]byte, error) {
+				atomic.AddInt64(&started, 1)
+				<-release
+				return make([]byte, payload), nil
+			})
+		}()
+	}
+	// Every f must be running before the drops, otherwise Get short-circuits on
+	// the canceled item and never produces a value to leak.
+	for atomic.LoadInt64(&started) < n {
+		time.Sleep(time.Millisecond)
+	}
+	for i := 0; i < n; i++ {
+		m.Drop(strconv.Itoa(i))
+	}
+	close(release)
+	wg.Wait()
+
+	if l := m.Len(); l != 0 {
+		t.Fatalf("Len() == %v after dropping every key, expected 0", l)
+	}
+	after := heapAlloc()
+	retained := int64(after) - int64(before)
+	t.Logf("heap: before=%v MiB after=%v MiB retained=%v MiB", before>>20, after>>20, retained>>20)
+	const maxRetained = 16 << 20
+	if retained > maxRetained {
+		t.Fatalf("map retains %v MiB after dropping %v running keys of 1 MiB, expected at most %v MiB — a dead item was re-armed and pins its value",
+			retained>>20, n, maxRetained>>20)
+	}
+	runtime.KeepAlive(m)
+}
+
+// Stop() cannot call back a callback that has already started: an expiry
+// callback can fire, park on the map lock, and only get in after the item was
+// evicted and another item took its key. Deleting by key alone would then take
+// out the replacement, so the callback checks identity. The window is produced
+// here by holding the map lock, which is the only thing the callback waits on.
+func TestFiredTimerDoesNotDropTheItemThatReplacedIt(t *testing.T) {
+	m := New[int](&Config{Expire: 30 * time.Millisecond})
+	if _, err := m.Get("k", func() (int, error) { return 1, nil }); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	m.mux.Lock()
+	old := m.m["k"]
+	time.Sleep(100 * time.Millisecond) // old's timer fires; the callback parks here
+	old.Cancel()                       // what clean()/Drop do — too late to stop it
+	delete(m.m, "k")
+	fresh := &lazyMapItem[int]{key: "k", val: 2, inited: true, la: time.Now()}
+	m.m["k"] = fresh
+	m.mux.Unlock()
+
+	time.Sleep(100 * time.Millisecond) // the callback gets the lock and runs
+	m.mux.RLock()
+	got := m.m["k"]
+	m.mux.RUnlock()
+	if got != fresh {
+		t.Fatalf("the evicted item's already-fired timer removed the item that replaced it (m[\"k\"] == %v)", got)
+	}
+}
+
+// Touch must keep postponing expiry, and the item must still expire once the
+// touching stops. Untested before, and the fix changed the timer underneath it:
+// Reset now reschedules an AfterFunc callback instead of a channel send.
+func TestTouchExtendsExpiry(t *testing.T) {
+	const expire = 300 * time.Millisecond
+	m := New[int](&Config{Expire: expire})
+	if _, err := m.Get("k", func() (int, error) { return 1, nil }); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	for i := 1; i <= 6; i++ { // 480ms of touching against a 300ms TTL
+		time.Sleep(80 * time.Millisecond)
+		if !m.Touch("k") {
+			t.Fatalf("Touch failed at %v: the item expired although it was touched every 80ms", time.Duration(i)*80*time.Millisecond)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := m.Status("k"); !ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the item never expired after touching stopped")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
