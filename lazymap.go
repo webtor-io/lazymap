@@ -33,7 +33,6 @@ type LazyMap[T any] struct {
 	capacity       int
 	cleanThreshold float64
 	cleanRatio     float64
-	cleaning       bool
 	evictNotInited bool
 }
 
@@ -240,6 +239,9 @@ func (s *LazyMap[T]) doExpire(expire time.Duration, key string, v *lazyMapItem[T
 	})
 }
 
+// clean evicts the least recently used items once the map is over
+// cleanThreshold. The caller holds s.mux for the whole call — which is why the
+// re-entrancy flag this used to keep could never be observed set.
 func (s *LazyMap[T]) clean() {
 	if s.capacity == 0 {
 		return
@@ -248,10 +250,6 @@ func (s *LazyMap[T]) clean() {
 	if len(s.m) <= thr {
 		return
 	}
-	if s.cleaning {
-		return
-	}
-	s.cleaning = true
 	t := make([]*lazyMapItem[T], 0, len(s.m))
 	for _, v := range s.m {
 		t = append(t, v)
@@ -281,7 +279,6 @@ func (s *LazyMap[T]) clean() {
 			break
 		}
 	}
-	s.cleaning = false
 }
 
 func (s *lazyMapItem[T]) Status() ItemStatus {
@@ -351,7 +348,7 @@ func (s *LazyMap[T]) Get(key string, f func() (T, error)) (T, error) {
 	r, err := v.Get()
 	s.c <- true
 	if err != nil && !s.storeErrors {
-		s.Drop(key)
+		s.dropItem(key, v)
 	} else if err != nil && s.errorExpire != 0 {
 		s.doExpire(s.errorExpire, key, v)
 	} else if err == nil && s.expire != 0 {
@@ -363,6 +360,21 @@ func (s *LazyMap[T]) Get(key string, f func() (T, error)) (T, error) {
 	return r, err
 }
 
+// dropItem removes v, and only v. Get's tail reaches here after f failed, by
+// which time the item may already have been dropped or expired out of the map
+// and a fresh item may hold the key — the same reason the expiry callback
+// checks identity. Dropping by key alone took that fresh item out and turned a
+// value that had just been computed into a miss.
+func (s *LazyMap[T]) dropItem(key string, v *lazyMapItem[T]) {
+	s.mux.Lock()
+	if cur, ok := s.m[key]; ok && cur == v {
+		cur.Cancel()
+		delete(s.m, key)
+	}
+	s.mux.Unlock()
+}
+
+// Drop removes whatever is stored under key, if anything.
 func (s *LazyMap[T]) Drop(key string) {
 	s.mux.Lock()
 	if v, ok := s.m[key]; ok {

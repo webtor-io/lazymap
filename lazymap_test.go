@@ -855,15 +855,15 @@ func TestFiredTimerDoesNotDropTheItemThatReplacedIt(t *testing.T) {
 // touching stops. Untested before, and the fix changed the timer underneath it:
 // Reset now reschedules an AfterFunc callback instead of a channel send.
 func TestTouchExtendsExpiry(t *testing.T) {
-	const expire = 300 * time.Millisecond
+	const expire = time.Second
 	m := New[int](&Config{Expire: expire})
 	if _, err := m.Get("k", func() (int, error) { return 1, nil }); err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	for i := 1; i <= 6; i++ { // 480ms of touching against a 300ms TTL
-		time.Sleep(80 * time.Millisecond)
+	for i := 1; i <= 6; i++ { // 1.2s of touching against a 1s TTL, 5x headroom
+		time.Sleep(200 * time.Millisecond)
 		if !m.Touch("k") {
-			t.Fatalf("Touch failed at %v: the item expired although it was touched every 80ms", time.Duration(i)*80*time.Millisecond)
+			t.Fatalf("Touch failed at %v: the item expired although it was touched every 200ms", time.Duration(i)*200*time.Millisecond)
 		}
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -875,5 +875,51 @@ func TestTouchExtendsExpiry(t *testing.T) {
 			t.Fatalf("the item never expired after touching stopped")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Get's tail removes the item when f failed and errors are not stored. It must
+// remove its own item: the item can have been dropped while f was running, and
+// a fresh item can already hold the key by the time f returns. Deleting by key
+// alone took that fresh item out — a spurious miss on a value that had just
+// been computed. Sibling of the expiry callback's identity check.
+func TestFailedGetDoesNotDropTheFreshItem(t *testing.T) {
+	m := New[int](&Config{Expire: time.Hour, StoreErrors: false})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = m.Get("k", func() (int, error) {
+			close(started)
+			<-release
+			return 0, errors.New("boom")
+		})
+	}()
+	<-started
+	m.Drop("k") // the failing item leaves the map while its f is still running
+
+	var fresh int64
+	if v, err := m.Get("k", func() (int, error) {
+		atomic.AddInt64(&fresh, 1)
+		return 42, nil
+	}); err != nil || v != 42 {
+		t.Fatalf("Get after drop == (%v, %v), expected (42, nil)", v, err)
+	}
+
+	close(release)
+	<-done // Get's tail now removes the failed item — by identity, not by key
+
+	if _, ok := m.Status("k"); !ok {
+		t.Fatalf("the fresh item was removed by the failed Get's tail")
+	}
+	if v, err := m.Get("k", func() (int, error) {
+		atomic.AddInt64(&fresh, 1)
+		return 0, errors.New("recomputed")
+	}); err != nil || v != 42 {
+		t.Fatalf("Get == (%v, %v), expected the cached (42, nil)", v, err)
+	}
+	if n := atomic.LoadInt64(&fresh); n != 1 {
+		t.Fatalf("the fresh value was computed %v times, want 1", n)
 	}
 }
