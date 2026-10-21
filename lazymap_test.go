@@ -1058,3 +1058,17 @@ func TestPanickingLoaderStoredAsFailure(t *testing.T) {
 		t.Fatalf("f executed %v times, want 1", n)
 	}
 }
+
+// Under GODEBUG=panicnil=1 — the pre-1.21 semantics, still selectable at run
+// time — panic(nil) recovers as nil. Keying on recover() != nil then took the
+// panic for a return and cached (nil, nil) as the value.
+func TestPanicNilLoaderReturnsError(t *testing.T) {
+	t.Setenv("GODEBUG", "panicnil=1")
+	m := New[*int](&Config{Expire: time.Hour})
+	if v, err := getRecovering(t, m, "k", func() (*int, error) { panic(nil) }); err == nil {
+		t.Fatalf("Get == (%v, nil) after panic(nil), expected an error", v)
+	}
+	if st, ok := m.Status("k"); ok {
+		t.Fatalf("Status == %v after panic(nil), expected the failed item to be dropped", st)
+	}
+}

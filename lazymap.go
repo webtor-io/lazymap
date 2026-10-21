@@ -234,15 +234,24 @@ func (s *lazyMapItem[T]) Get() (T, error) {
 // LazyMap.Get never gave back its concurrency slot, so after Concurrency
 // panics no key loaded at all. Returned rather than re-raised: callers log
 // errors, while a panic caught by an HTTP framework's recovery is easy to miss.
+//
+// A panic is told by f not returning, not by recover() != nil: under
+// GODEBUG=panicnil=1 panic(nil) recovers as nil, and that check published
+// (zero, nil) as a value and cached it.
 func safeCall[T any](f func() (T, error)) (val T, err error) {
+	returned := false
 	defer func() {
-		if r := recover(); r != nil {
-			st := make([]byte, 8<<10) // the panic site and its callers; deep stacks are cut
-			st = st[:runtime.Stack(st, false)]
-			err = fmt.Errorf("lazymap: panic in f: %v\n%s", r, st)
+		if returned {
+			return
 		}
+		r := recover()
+		st := make([]byte, 8<<10) // the panic site and its callers; deep stacks are cut
+		st = st[:runtime.Stack(st, false)]
+		err = fmt.Errorf("lazymap: panic in f: %v\n%s", r, st)
 	}()
-	return f()
+	val, err = f()
+	returned = true
+	return val, err
 }
 
 func (s *LazyMap[T]) doExpire(expire time.Duration, key string, v *lazyMapItem[T]) {
