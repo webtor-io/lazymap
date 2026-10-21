@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 type TestMap struct {
@@ -938,8 +939,11 @@ func getRecovering[T any](t *testing.T, m *LazyMap[T], key string, f func() (T, 
 
 // A panic in f escaped Get with nothing in lazymap recovering it: the item
 // stayed running with done open, and every later Get of the key blocked
-// forever. The leader must get the panic, with its stack, as an error, and the
-// item must go like any failed one, so the next Get runs f again.
+// forever. The leader must get the panic as a *PanicError, and the item must go
+// like any failed one, so the next Get runs f again.
+//
+// The stack is in Stack, never in Error(): rest-api returns err.Error() to API
+// clients and torrent-store puts it in gRPC statuses.
 func TestPanickingLoaderReturnsError(t *testing.T) {
 	m := New[int](&Config{Expire: time.Hour})
 	var calls int64
@@ -947,8 +951,15 @@ func TestPanickingLoaderReturnsError(t *testing.T) {
 		atomic.AddInt64(&calls, 1)
 		panic("bad tiff")
 	})
-	if err == nil || !strings.Contains(err.Error(), "bad tiff") || !strings.Contains(err.Error(), "lazymap_test.go") {
-		t.Fatalf("Get == %v, expected an error carrying the panic value and its stack", err)
+	if err == nil || !strings.Contains(err.Error(), "bad tiff") {
+		t.Fatalf("Get == %v, expected an error carrying the panic value", err)
+	}
+	if msg := err.Error(); strings.Contains(msg, "goroutine ") || strings.Contains(msg, "lazymap_test.go") {
+		t.Fatalf("Error() == %q, expected no stack", msg)
+	}
+	var pe *PanicError
+	if !errors.As(err, &pe) || pe.Value != "bad tiff" || !strings.Contains(string(pe.Stack), "lazymap_test.go") {
+		t.Fatalf("Get == %#v, expected a *PanicError with the value and a stack through the panic site", err)
 	}
 	if st, ok := m.Status("k"); ok {
 		t.Fatalf("Status == %v after the panic, expected the failed item to be dropped", st)
@@ -1065,10 +1076,46 @@ func TestPanickingLoaderStoredAsFailure(t *testing.T) {
 func TestPanicNilLoaderReturnsError(t *testing.T) {
 	t.Setenv("GODEBUG", "panicnil=1")
 	m := New[*int](&Config{Expire: time.Hour})
-	if v, err := getRecovering(t, m, "k", func() (*int, error) { panic(nil) }); err == nil {
+	v, err := getRecovering(t, m, "k", func() (*int, error) { panic(nil) })
+	if err == nil {
 		t.Fatalf("Get == (%v, nil) after panic(nil), expected an error", v)
+	}
+	var pe *PanicError
+	if !errors.As(err, &pe) || pe.Value != nil || err.Error() != "lazymap: panic in f: <nil>" {
+		t.Fatalf("Get == %#v, expected a *PanicError with a nil Value", err)
 	}
 	if st, ok := m.Status("k"); ok {
 		t.Fatalf("Status == %v after panic(nil), expected the failed item to be dropped", st)
+	}
+}
+
+// A panicked error must stay reachable through errors.Is/As, as a returned one
+// is: callers branch on it (context.Canceled, a domain sentinel).
+func TestPanicErrorUnwrapsPanickedError(t *testing.T) {
+	errBadTiff := errors.New("bad tiff")
+	m := New[int](&Config{Expire: time.Hour})
+	_, err := getRecovering(t, m, "k", func() (int, error) { panic(fmt.Errorf("decode: %w", errBadTiff)) })
+	if !errors.Is(err, errBadTiff) {
+		t.Fatalf("Get == %v, expected errors.Is to reach the panicked error", err)
+	}
+}
+
+// A panic value is arbitrary — a dumped request, a multi-line message — and
+// Error() lands in log lines and client responses: one line, at most 200 runes
+// of value, cut on a rune boundary. Value itself is kept whole.
+func TestPanicErrorMessageIsShortAndFlat(t *testing.T) {
+	val := strings.Repeat("плохой tiff\r\n", 50)
+	e := &PanicError{Value: val}
+	msg := e.Error()
+	const prefix = "lazymap: panic in f: "
+	if strings.ContainsAny(msg, "\r\n") {
+		t.Fatalf("Error() == %q, expected no line breaks", msg)
+	}
+	if !strings.HasPrefix(msg, prefix+"плохой tiff  плохой") || !utf8.ValidString(msg) ||
+		utf8.RuneCountInString(msg) != utf8.RuneCountInString(prefix)+200 {
+		t.Fatalf("Error() == %q, expected the prefix and the first 200 runes of the value", msg)
+	}
+	if e.Value != val {
+		t.Fatalf("Value was modified")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"math"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -62,6 +63,40 @@ type EvictedError struct{}
 
 func (s *EvictedError) Error() string {
 	return "Evicted"
+}
+
+// PanicError is a panic in f, returned as Get's error. Error leaves the stack
+// out: callers hand errors to clients (rest-api's JSON body, torrent-store's
+// gRPC status), and a stack there leaks source paths. Log Stack explicitly.
+type PanicError struct {
+	Value any
+	Stack []byte
+}
+
+// Error renders Value on one line, cut to 200 runes: a panic value can be any
+// size, and the message ends up in log lines and client responses.
+func (e *PanicError) Error() string {
+	v := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' {
+			return ' '
+		}
+		return r
+	}, fmt.Sprintf("%v", e.Value))
+	n := 0
+	for i := range v {
+		if n == 200 {
+			v = v[:i]
+			break
+		}
+		n++
+	}
+	return "lazymap: panic in f: " + v
+}
+
+// Unwrap gives errors.Is/As the panicked value when it is an error.
+func (e *PanicError) Unwrap() error {
+	err, _ := e.Value.(error)
+	return err
 }
 
 func New[T any](cfg *Config) *LazyMap[T] {
@@ -246,8 +281,7 @@ func safeCall[T any](f func() (T, error)) (val T, err error) {
 		}
 		r := recover()
 		st := make([]byte, 8<<10) // the panic site and its callers; deep stacks are cut
-		st = st[:runtime.Stack(st, false)]
-		err = fmt.Errorf("lazymap: panic in f: %v\n%s", r, st)
+		err = &PanicError{Value: r, Stack: st[:runtime.Stack(st, false)]}
 	}()
 	val, err = f()
 	returned = true
