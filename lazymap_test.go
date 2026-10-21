@@ -1005,11 +1005,17 @@ func TestPanickingLoaderReleasesWaiters(t *testing.T) {
 	close(release)
 
 	deadline := time.After(5 * time.Second)
+	var first error
 	for i := 0; i < n; i++ {
 		select {
 		case err := <-errs:
 			if err == nil || !strings.Contains(err.Error(), "bad tiff") {
 				t.Errorf("Get == %v, expected the panic as an error", err)
+			}
+			if first == nil {
+				first = err
+			} else if err != first {
+				t.Errorf("Get == %p, expected %p: waiters get the leader's *PanicError, not a copy or a wrap", err, first)
 			}
 		case <-deadline:
 			t.Fatalf("%v of %v Gets still blocked 5s after f panicked", n-i, n)
@@ -1058,12 +1064,12 @@ func TestPanickingLoaderStoredAsFailure(t *testing.T) {
 		atomic.AddInt64(&calls, 1)
 		panic("bad tiff")
 	}
-	_, _ = getRecovering(t, m, "k", f)
+	_, err := getRecovering(t, m, "k", f)
 	if st, ok := m.Status("k"); !ok || st != Failed {
 		t.Fatalf("Status == (%v, %v) after the panic, expected (Failed, true)", st, ok)
 	}
-	if _, err := getRecovering(t, m, "k", f); err == nil || !strings.Contains(err.Error(), "bad tiff") {
-		t.Fatalf("second Get == %v, expected the stored panic error", err)
+	if _, err2 := getRecovering(t, m, "k", f); err == nil || err2 != err {
+		t.Fatalf("second Get == %v, expected the stored *PanicError %p", err2, err)
 	}
 	if n := atomic.LoadInt64(&calls); n != 1 {
 		t.Fatalf("f executed %v times, want 1", n)
@@ -1117,5 +1123,8 @@ func TestPanicErrorMessageIsShortAndFlat(t *testing.T) {
 	}
 	if e.Value != val {
 		t.Fatalf("Value was modified")
+	}
+	if msg := (&PanicError{Value: "a\vb\fc\u0085d\u2028e\u2029f\x1bg"}).Error(); msg != prefix+"a b c d e f g" {
+		t.Fatalf("Error() == %q, expected each line break and control character as a space", msg)
 	}
 }

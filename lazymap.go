@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type ItemStatus int
@@ -74,10 +75,12 @@ type PanicError struct {
 }
 
 // Error renders Value on one line, cut to 200 runes: a panic value can be any
-// size, and the message ends up in log lines and client responses.
+// size, and the message ends up in log lines and client responses. Control
+// characters (\v, \f and NEL break lines too, ESC drives terminals) and
+// U+2028/U+2029 become spaces.
 func (e *PanicError) Error() string {
 	v := strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\r' {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
 			return ' '
 		}
 		return r
