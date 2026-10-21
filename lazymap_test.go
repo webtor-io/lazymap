@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -921,5 +922,139 @@ func TestFailedGetDoesNotDropTheFreshItem(t *testing.T) {
 	}
 	if n := atomic.LoadInt64(&fresh); n != 1 {
 		t.Fatalf("the fresh value was computed %v times, want 1", n)
+	}
+}
+
+// getRecovering calls Get the way a handler behind a recovering HTTP middleware
+// does: a panic escaping Get fails the test instead of crashing the binary.
+func getRecovering[T any](t *testing.T, m *LazyMap[T], key string, f func() (T, error)) (v T, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("panic escaped Get(%q): %v", key, r)
+		}
+	}()
+	return m.Get(key, f)
+}
+
+// A panic in f escaped Get with nothing in lazymap recovering it: the item
+// stayed running with done open, and every later Get of the key blocked
+// forever. The leader must get the panic, with its stack, as an error, and the
+// item must go like any failed one, so the next Get runs f again.
+func TestPanickingLoaderReturnsError(t *testing.T) {
+	m := New[int](&Config{Expire: time.Hour})
+	var calls int64
+	_, err := getRecovering(t, m, "k", func() (int, error) {
+		atomic.AddInt64(&calls, 1)
+		panic("bad tiff")
+	})
+	if err == nil || !strings.Contains(err.Error(), "bad tiff") || !strings.Contains(err.Error(), "lazymap_test.go") {
+		t.Fatalf("Get == %v, expected an error carrying the panic value and its stack", err)
+	}
+	if st, ok := m.Status("k"); ok {
+		t.Fatalf("Status == %v after the panic, expected the failed item to be dropped", st)
+	}
+	if v, err := getRecovering(t, m, "k", func() (int, error) {
+		atomic.AddInt64(&calls, 1)
+		return 42, nil
+	}); err != nil || v != 42 {
+		t.Fatalf("Get after the panic == (%v, %v), expected (42, nil)", v, err)
+	}
+	if n := atomic.LoadInt64(&calls); n != 2 {
+		t.Fatalf("f executed %v times, want 2 — a panic must not be cached when errors are not stored", n)
+	}
+}
+
+// Every Get waiting on a panicking f must be released with the leader's error.
+// Before, they blocked on done forever; the timeout makes that a failure rather
+// than a hung test.
+func TestPanickingLoaderReleasesWaiters(t *testing.T) {
+	const n = 20
+	before := runtime.NumGoroutine()
+	m := New[int](&Config{Expire: time.Hour})
+	var calls int64
+	release := make(chan struct{})
+	f := func() (int, error) {
+		atomic.AddInt64(&calls, 1)
+		<-release
+		panic("bad tiff")
+	}
+	errs := make(chan error, n)
+	get := func() {
+		_, err := getRecovering(t, m, "k", f)
+		errs <- err
+	}
+	go get()
+	for st, _ := m.Status("k"); st != Running; st, _ = m.Status("k") {
+		time.Sleep(time.Millisecond)
+	}
+	for i := 1; i < n; i++ {
+		go get()
+	}
+	time.Sleep(100 * time.Millisecond) // the waiters park on done
+	close(release)
+
+	deadline := time.After(5 * time.Second)
+	for i := 0; i < n; i++ {
+		select {
+		case err := <-errs:
+			if err == nil || !strings.Contains(err.Error(), "bad tiff") {
+				t.Errorf("Get == %v, expected the panic as an error", err)
+			}
+		case <-deadline:
+			t.Fatalf("%v of %v Gets still blocked 5s after f panicked", n-i, n)
+		}
+	}
+	if c := atomic.LoadInt64(&calls); c != 1 {
+		t.Fatalf("f executed %v times, want 1 — waiters must share the leader's outcome", c)
+	}
+	limit := before + 5
+	after := runtime.NumGoroutine()
+	for deadline := time.Now().Add(2 * time.Second); after > limit && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		after = runtime.NumGoroutine()
+	}
+	if after > limit {
+		t.Fatalf("goroutines: %v before, %v after (expected at most %v)", before, after, limit)
+	}
+}
+
+// The panic also skipped handing back the leader's concurrency slot: after
+// Concurrency panics, no key — panicking or not — could load any more.
+func TestPanickingLoaderReturnsConcurrencySlot(t *testing.T) {
+	m := New[int](&Config{Concurrency: 1})
+	_, _ = getRecovering(t, m, "a", func() (int, error) { panic("bad tiff") })
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Get("b", func() (int, error) { return 1, nil })
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Get(b): %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Get of another key still blocked 5s after a panic at Concurrency 1 — the slot was never returned")
+	}
+}
+
+// With StoreErrors the panic is kept like any returned error: Failed, not
+// Running, and served without running f again until ErrorExpire.
+func TestPanickingLoaderStoredAsFailure(t *testing.T) {
+	m := New[int](&Config{StoreErrors: true, ErrorExpire: time.Hour})
+	var calls int64
+	f := func() (int, error) {
+		atomic.AddInt64(&calls, 1)
+		panic("bad tiff")
+	}
+	_, _ = getRecovering(t, m, "k", f)
+	if st, ok := m.Status("k"); !ok || st != Failed {
+		t.Fatalf("Status == (%v, %v) after the panic, expected (Failed, true)", st, ok)
+	}
+	if _, err := getRecovering(t, m, "k", f); err == nil || !strings.Contains(err.Error(), "bad tiff") {
+		t.Fatalf("second Get == %v, expected the stored panic error", err)
+	}
+	if n := atomic.LoadInt64(&calls); n != 1 {
+		t.Fatalf("f executed %v times, want 1", n)
 	}
 }

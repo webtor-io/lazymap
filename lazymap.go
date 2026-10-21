@@ -1,7 +1,9 @@
 package lazymap
 
 import (
+	"fmt"
 	"math"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -212,7 +214,7 @@ func (s *lazyMapItem[T]) Get() (T, error) {
 		var zero T
 		val, err = zero, &EvictedError{}
 	} else {
-		val, err = f()
+		val, err = safeCall(f)
 	}
 
 	s.mux.Lock()
@@ -223,6 +225,24 @@ func (s *lazyMapItem[T]) Get() (T, error) {
 	close(s.done)
 	s.mux.Unlock()
 	return val, err
+}
+
+// safeCall runs f and returns a panic in it as f's error, so it takes the same
+// path as a returned one: published, done closed, the item dropped or kept per
+// StoreErrors. A panic that escaped skipped all of that — running stayed set
+// and done open, so every later Get of the key blocked forever, and
+// LazyMap.Get never gave back its concurrency slot, so after Concurrency
+// panics no key loaded at all. Returned rather than re-raised: callers log
+// errors, while a panic caught by an HTTP framework's recovery is easy to miss.
+func safeCall[T any](f func() (T, error)) (val T, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			st := make([]byte, 8<<10) // the panic site and its callers; deep stacks are cut
+			st = st[:runtime.Stack(st, false)]
+			err = fmt.Errorf("lazymap: panic in f: %v\n%s", r, st)
+		}
+	}()
+	return f()
 }
 
 func (s *LazyMap[T]) doExpire(expire time.Duration, key string, v *lazyMapItem[T]) {
